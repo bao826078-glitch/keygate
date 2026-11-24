@@ -10,14 +10,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: build-armv7-${{ github.ref }}
+  group: keygate-armv7-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Linux ARMv7 / Alpine
+    name: Alpine Linux ARMv7
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
 
     env:
       GOOS: linux
@@ -26,28 +26,66 @@ jobs:
       CGO_ENABLED: "0"
 
     steps:
+      # 1. Checkout source
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go 1.27
+      # 2. Inspect GitHub runner architecture
+      - name: Check build environment
+        run: |
+          echo "========== RUNNER =========="
+          uname -a
+          uname -m
+          cat /etc/os-release
+
+          echo "========== GO =========="
+          go version || true
+          go env || true
+
+          echo "========== TARGET =========="
+          echo "GOOS=$GOOS"
+          echo "GOARCH=$GOARCH"
+          echo "GOARM=$GOARM"
+          echo "CGO_ENABLED=$CGO_ENABLED"
+
+      # 3. Setup Go
+      - name: Setup Go
         uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
           cache: true
 
+      # 4. Setup Bun
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
 
+      # 5. Verify target architecture
+      - name: Verify architecture
+        run: |
+          test "$GOOS" = "linux"
+          test "$GOARCH" = "arm"
+          test "$GOARM" = "7"
+          test "$CGO_ENABLED" = "0"
+
+          echo "Target verified: Linux ARMv7 32-bit"
+
+      # 6. Check project dependencies
+      - name: Check Go dependencies
+        run: |
+          go mod download
+          go list -deps ./cmd/server > /tmp/dependencies.txt
+          echo "Dependencies:"
+          wc -l /tmp/dependencies.txt
+
+      # 7. Build frontend
       - name: Build frontend
         run: |
           cd web
           bun install --frozen-lockfile
           bun run build
 
-      - name: Download Go dependencies
-        run: go mod download
-
-      - name: Cross compile ARMv7
+      # 8. Cross compile backend
+      - name: Build ARMv7 binary
         run: |
           mkdir -p bin
 
@@ -57,22 +95,33 @@ jobs:
 
           go build \
             -trimpath \
-            -ldflags "\
-              -X github.com/tabloy/keygate/internal/version.Version=${VERSION} \
-              -X github.com/tabloy/keygate/internal/version.Commit=${COMMIT} \
-              -X github.com/tabloy/keygate/internal/version.BuildDate=${BUILD_DATE}" \
+            -ldflags "-s -w" \
             -o bin/keygate \
             ./cmd/server
 
+      # 9. Verify ELF architecture
       - name: Verify binary
         run: |
+          echo "========== FILE =========="
           file bin/keygate
+
+          echo "========== ELF HEADER =========="
           readelf -h bin/keygate
 
           readelf -h bin/keygate | grep -q 'ELF32'
           readelf -h bin/keygate | grep -q 'ARM'
 
-      - name: Package release
+          echo "========== INTERPRETER =========="
+          readelf -l bin/keygate | grep interpreter || \
+            echo "No dynamic interpreter"
+
+          echo "========== SIZE =========="
+          ls -lh bin/keygate
+
+          echo "ARMv7 verification passed!"
+
+      # 10. Package release
+      - name: Package Alpine ARMv7
         run: |
           mkdir -p release/keygate
 
@@ -84,14 +133,15 @@ jobs:
           cat > release/keygate/BUILD-INFO.txt <<EOF
           Project: Keygate
           OS: Linux
-          Target: Alpine Linux
-          Architecture: ARMv7 32-bit
+          Distribution: Alpine Linux
+          Architecture: ARMv7
           GOOS: linux
           GOARCH: arm
           GOARM: 7
           CGO_ENABLED: 0
           Database: External PostgreSQL
           Commit: $(git rev-parse --short HEAD)
+          Build date: $(date -u)
           EOF
 
           tar -czf keygate-alpine-armv7.tar.gz \
@@ -100,7 +150,8 @@ jobs:
           sha256sum keygate-alpine-armv7.tar.gz \
             > keygate-alpine-armv7.tar.gz.sha256
 
-      - name: Upload build artifact
+      # 11. Upload artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: keygate-alpine-armv7
